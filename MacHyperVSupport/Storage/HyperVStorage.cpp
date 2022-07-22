@@ -7,6 +7,8 @@
 
 #include "HyperVStorage.hpp"
 
+#include <Headers/kern_api.hpp>
+
 OSDefineMetaClassAndStructors(HyperVStorage, super);
 
 //
@@ -41,7 +43,6 @@ static const HyperVStorageProtocol storageProtocols[] = {
 };
 
 bool HyperVStorage::InitializeController() {
-  HVDBGLOG("Initializing Hyper-V Synthetic Storage controller");
   HyperVStoragePacket packet;
   
   //
@@ -53,6 +54,11 @@ bool HyperVStorage::InitializeController() {
   }
   hvDevice->retain();
   
+  debugEnabled = checkKernelArgument("-hvstordbg");
+  hvDevice->setDebugMessagePrinting(checkKernelArgument("-hvstormsgdbg"));
+  
+  HVDBGLOG("Initializing Hyper-V Synthetic Storage controller");
+  
   //
   // Assume we are on an older host and take off the Windows 8 extensions by default.
   //
@@ -60,11 +66,21 @@ bool HyperVStorage::InitializeController() {
   
   //
   // Configure interrupt.
+  // macOS 10.4 always configures the interrupt in the superclass, do
+  // not configure the interrupt ourselves in that case.
   //
-  interruptSource =
-    IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventAction, this, &HyperVStorage::handleInterrupt), getProvider(), 0);
-  getProvider()->getWorkLoop()->addEventSource(interruptSource);
-  interruptSource->enable();
+#if __MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_5
+  if (getKernelVersion() >= KernelVersion::Leopard) {
+#endif
+    interruptSource =
+      IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventAction, this, &HyperVStorage::handleInterrupt), getProvider(), 0);
+    getProvider()->getWorkLoop()->addEventSource(interruptSource);
+    interruptSource->enable();
+#if __MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_5
+  } else {
+    EnableInterrupt();
+  }
+#endif
   
   //
   // Configure the channel.
@@ -205,6 +221,13 @@ bool HyperVStorage::InitializeTargetForID(SCSITargetIdentifier targetID) {
 }
 
 void HyperVStorage::HandleInterruptRequest() {
+#if __MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_5
+  //
+  // macOS 10.4 configures the interrupt in the superclass, invoke
+  // our interrupt handler here.
+  //
+  handleInterrupt(this, NULL, 0);
+#endif
 }
 
 SCSIInitiatorIdentifier HyperVStorage::ReportInitiatorIdentifier() {

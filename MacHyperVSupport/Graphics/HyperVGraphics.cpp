@@ -11,6 +11,8 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceTreeSupport.h>
 
+#include <Headers/kern_api.hpp>
+
 OSDefineMetaClassAndStructors(HyperVGraphics, super);
 
 void HyperVGraphics::fillFakePCIDeviceSpace() {
@@ -32,10 +34,23 @@ bool HyperVGraphics::configure(IOService *provider) {
   UInt32 fbSize = (UInt32)(consoleInfo.v_height * consoleInfo.v_rowBytes);
   
   addBridgeMemoryRange(consoleInfo.v_baseAddr, fbSize, true);
-  return true;
+  return super::configure(provider);
 }
 
 bool HyperVGraphics::start(IOService *provider) {
+  //
+  // Get parent VMBus device object.
+  //
+  hvDevice = OSDynamicCast(HyperVVMBusDevice, provider);
+  if (hvDevice == NULL) {
+    super::stop(provider);
+    return false;
+  }
+  hvDevice->retain();
+  
+  debugEnabled = checkKernelArgument("-hvgfxdbg");
+  hvDevice->setDebugMessagePrinting(checkKernelArgument("-hvgfxmsgdbg"));
+  
   //
   // Do not start on Gen1 VMs.
   //
@@ -44,6 +59,7 @@ bool HyperVGraphics::start(IOService *provider) {
     HVDBGLOG("Existing PCI bus found (Gen1 VM), will not start");
     
     pciEntry->release();
+    hvDevice->release();
     return false;
   }
   
@@ -52,6 +68,7 @@ bool HyperVGraphics::start(IOService *provider) {
   //
   if (!HyperVPCIRoot::registerChildPCIBridge(this)) {
     HVSYSLOG("Failed to register with root PCI bus instance");
+    hvDevice->release();
     return false;
   }
   
@@ -61,6 +78,7 @@ bool HyperVGraphics::start(IOService *provider) {
   //
   if (getPlatform()->getConsoleInfo(&consoleInfo) != kIOReturnSuccess) {
     HVSYSLOG("Failed to get console info");
+    hvDevice->release();
     return false;
   }
   HVDBGLOG("Console is at 0x%X (%ux%u, bpp: %u, bytes/row: %u)",

@@ -23,10 +23,13 @@ Hyper-V integration services for macOS. Requires a Generation 2 virtual machine 
 - On older versions of macOS, IOSCSIParallelFamily (`com.apple.iokit.IOSCSIParallelFamily`) may need to be Force injected. Refer to the OpenCore Configuration manual for details.
 - Booter quirks
   - `AllowRelocationBlock` - required for macOS 10.7 and older
+  - `AvoidRuntimeDefrag` - required
   - `ForceExitBootServices` - required for macOS 10.7 and older
   - `RebuildAppleMemoryMap` - required for macOS 10.6 and older
 - Kernel quirks
   - `ProvideCurrentCpuInfo` - required for proper TSC/FSB values and CPU topology values.
+- UEFI quirks
+  - `DisableSecurityPolicy` - required on Windows 10 and newer
 - [Lilu](https://github.com/acidanthera/Lilu) is required for patching and library functions
 - Installer images can either be passed in from USB hard disks, or converted from a DMG to a VHDX image using `qemu-img`:
   - DMGs need to be in a read/write format first.
