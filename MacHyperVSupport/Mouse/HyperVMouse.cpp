@@ -2,77 +2,96 @@
 //  HyperVMouse.cpp
 //  Hyper-V mouse driver
 //
-//  Copyright © 2021 Goldfish64. All rights reserved.
+//  Copyright © 2021-2022 Goldfish64. All rights reserved.
 //
 
 #include "HyperVMouse.hpp"
 
-#include <Headers/kern_api.hpp>
-
 OSDefineMetaClassAndStructors(HyperVMouse, super);
 
 bool HyperVMouse::handleStart(IOService *provider) {
-  if (!super::handleStart(provider)) {
-    return false;
-  }
+  bool     result = false;
+  IOReturn status;
 
   //
   // Get parent VMBus device object.
   //
-  hvDevice = OSDynamicCast(HyperVVMBusDevice, provider);
-  if (hvDevice == NULL) {
+  _hvDevice = OSDynamicCast(HyperVVMBusDevice, provider);
+  if (_hvDevice == nullptr) {
+    HVSYSLOG("Provider is not HyperVVMBusDevice");
     return false;
   }
-  hvDevice->retain();
-  
-  debugEnabled = checkKernelArgument("-hvmousdbg");
-  hvDevice->setDebugMessagePrinting(checkKernelArgument("-hvmousmsgdbg"));
-  
+  _hvDevice->retain();
+
+  HVCheckDebugArgs();
+  HVDBGLOG("Initializing Hyper-V Synthetic Mouse");
+
+  if (HVCheckOffArg()) {
+    HVSYSLOG("Disabling Hyper-V Synthetic Mouse due to boot arg");
+    OSSafeReleaseNULL(_hvDevice);
+    return false;
+  }
+
+  if (!super::handleStart(provider)) {
+    HVSYSLOG("super::handleStart() returned false");
+    OSSafeReleaseNULL(_hvDevice);
+    return false;
+  }
+
   //
   // HIDDefaultBehavior needs to be set to Mouse for the device to
   // get exposed as a mouse to userspace.
   //
-  HVDBGLOG("Initializing Hyper-V Synthetic Mouse");
   setProperty("HIDDefaultBehavior", "Mouse");
-  
-  //
-  // Configure interrupt.
-  //
-  interruptSource =
-    IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventAction, this, &HyperVMouse::handleInterrupt), provider, 0);
-  getWorkLoop()->addEventSource(interruptSource);
-  interruptSource->enable();
 
-  //
-  // Configure the channel.
-  //
-  if (!hvDevice->openChannel(kHyperVMouseRingBufferSize, kHyperVMouseRingBufferSize)) {
-    return false;
+  do {
+    //
+    // Install packet handler.
+    //
+    status = _hvDevice->installPacketActions(this, OSMemberFunctionCast(HyperVVMBusDevice::PacketReadyAction, this, &HyperVMouse::handlePacket),
+                                             nullptr, kHyperVMouseResponsePacketSize);
+    if (status != kIOReturnSuccess) {
+      HVSYSLOG("Failed to install packet handler with status 0x%X", status);
+      break;
+    }
+
+    //
+    // Open VMBus channel.
+    //
+    status = _hvDevice->openVMBusChannel(kHyperVMouseRingBufferSize, kHyperVMouseRingBufferSize);
+    if (status != kIOReturnSuccess) {
+      HVSYSLOG("Failed to open VMBus channel with status 0x%X", status);
+      break;
+    }
+
+    //
+    // Configure Hyper-V mouse device.
+    //
+    if (!setupMouse()) {
+      HVSYSLOG("Unable to setup mouse device");
+      break;
+    }
+
+    HVDBGLOG("Initialized Hyper-V Synthetic Mouse");
+    result = true;
+  } while (false);
+
+  if (!result) {
+    _hvDevice->closeVMBusChannel();
+    _hvDevice->uninstallPacketActions();
+    OSSafeReleaseNULL(_hvDevice);
   }
 
-  if (!setupMouse()) {
-    HVSYSLOG("Failed to set up device");
-    return false;
-  }
-  
-  HVSYSLOG("Initialized Hyper-V Synthetic Mouse");
-  return true;
+  return result;
 }
 
 void HyperVMouse::handleStop(IOService *provider) {
-  HVDBGLOG("Hyper-V Mouse is stopping");
+  HVDBGLOG("Hyper-V Synthetic Mouse is stopping");
 
-  if (hidDescriptor != NULL) {
-    IOFree(hidDescriptor, hidDescriptorLength);
-    hidDescriptor = NULL;
-  }
-
-  //
-  // Close channel and remove interrupt sources.
-  //
-  if (hvDevice != NULL) {
-    hvDevice->closeChannel();
-    hvDevice->release();
+  if (_hvDevice != nullptr) {
+    _hvDevice->closeVMBusChannel();
+    _hvDevice->uninstallPacketActions();
+    OSSafeReleaseNULL(_hvDevice);
   }
 
   super::handleStop(provider);
@@ -91,20 +110,20 @@ OSString* HyperVMouse::newProductString() const {
 }
 
 OSNumber* HyperVMouse::newVendorIDNumber() const {
-  return OSNumber::withNumber(mouseInfo.vendor, 16);
+  return OSNumber::withNumber(_mouseInfo.vendor, 16);
 }
 
 OSNumber* HyperVMouse::newProductIDNumber() const {
-  return OSNumber::withNumber(mouseInfo.product, 16);
+  return OSNumber::withNumber(_mouseInfo.product, 16);
 }
 
 OSNumber* HyperVMouse::newVersionNumber() const {
-  return OSNumber::withNumber(mouseInfo.version, 16);
+  return OSNumber::withNumber(_mouseInfo.version, 16);
 }
 
 IOReturn HyperVMouse::newReportDescriptor(IOMemoryDescriptor **descriptor) const {
-  IOBufferMemoryDescriptor *bufferDesc = IOBufferMemoryDescriptor::withBytes(hidDescriptor, hidDescriptorLength, kIODirectionNone);
-  if (bufferDesc == NULL) {
+  IOBufferMemoryDescriptor *bufferDesc = IOBufferMemoryDescriptor::withBytes(_hidDescriptor, _hidDescriptorLength, kIODirectionNone);
+  if (bufferDesc == nullptr) {
     HVSYSLOG("Failed to allocate report descriptor buffer descriptor");
     return kIOReturnNoResources;
   }

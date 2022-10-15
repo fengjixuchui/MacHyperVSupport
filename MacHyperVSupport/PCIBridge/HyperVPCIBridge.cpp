@@ -6,23 +6,24 @@
 //
 
 #include "HyperVPCIBridge.hpp"
-#include <Headers/kern_api.hpp>
 #include "HyperVPCIRoot.hpp"
 
 OSDefineMetaClassAndStructors(HyperVPCIBridge, super);
 
 bool HyperVPCIBridge::start(IOService *provider) {
+  if (HVCheckOffArg()) {
+    return false;
+  }
+  
   //
   // Get parent VMBus device object.
   //
-  hvDevice = OSDynamicCast(HyperVVMBusDevice, provider);
-  if (hvDevice == NULL) {
+  _hvDevice = OSDynamicCast(HyperVVMBusDevice, provider);
+  if (_hvDevice == NULL) {
     return false;
   }
-  hvDevice->retain();
-  
-  debugEnabled = checkKernelArgument("-hvpcidbg");
-  hvDevice->setDebugMessagePrinting(checkKernelArgument("-hvpcimsgdbg"));
+  _hvDevice->retain();
+  HVCheckDebugArgs();
   
   //
   // Configure interrupt.
@@ -35,7 +36,7 @@ bool HyperVPCIBridge::start(IOService *provider) {
   //
   // Configure the channel.
   //
-  if (!hvDevice->openChannel(kHyperVPCIBridgeRingBufferSize, kHyperVPCIBridgeRingBufferSize, 0xFFFFFFFF)) {
+  if (_hvDevice->openVMBusChannel(kHyperVPCIBridgeRingBufferSize, kHyperVPCIBridgeRingBufferSize, 0xFFFFFFFF) != kIOReturnSuccess) {
     return false;
   }
   
@@ -46,13 +47,13 @@ bool HyperVPCIBridge::start(IOService *provider) {
   //
   if (!HyperVPCIRoot::registerChildPCIBridge(this)) {
     HVSYSLOG("Failed to register with root PCI bus instance");
-    hvDevice->release();
+    _hvDevice->release();
     return false;
   }
   
   // Negoiate protocol version and send request for functions.
   if (!negotiateProtocolVersion() || !allocatePCIConfigWindow() || !queryBusRelations() || !enterPCID0() || !queryResourceRequirements() || !sendResourcesAllocated(0)) {
-    hvDevice->closeChannel();
+    _hvDevice->closeVMBusChannel();
     return false;
   }
   
@@ -150,7 +151,7 @@ void HyperVPCIBridge::configWrite16(IOPCIAddressSpace space, UInt8 offset, UInt1
       pktInt.cpuMask = 1;
       
       HyperVPCIBridgeMessageCreateInterruptResponse pciStatus;
-      if (hvDevice->writeInbandPacket(&pktInt, sizeof (pktInt), true, &pciStatus, sizeof (pciStatus)) != kIOReturnSuccess) {
+      if (_hvDevice->writeInbandPacket(&pktInt, sizeof (pktInt), true, &pciStatus, sizeof (pciStatus)) != kIOReturnSuccess) {
        // return false;
       }
       

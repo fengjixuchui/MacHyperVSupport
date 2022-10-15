@@ -13,6 +13,8 @@
 
 class HyperVPCIRoot : public HV_PCIBRIDGE_CLASS {
   OSDeclareDefaultStructors(HyperVPCIRoot);
+  HVDeclareLogFunctions("pcir");
+  typedef HV_PCIBRIDGE_CLASS super;
   
 private:
   IOSimpleLock *pciLock = NULL;

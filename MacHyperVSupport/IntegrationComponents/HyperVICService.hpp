@@ -8,29 +8,28 @@
 #ifndef HyperVICService_hpp
 #define HyperVICService_hpp
 
-#include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOService.h>
 
 #include "HyperVVMBusDevice.hpp"
 #include "HyperVIC.hpp"
 
-#define kHyperVICBufferSize     4096
+#define kHyperVICBufferSize     PAGE_SIZE
 
 class HyperVICService : public IOService {
   OSDeclareDefaultStructors(HyperVICService);
+  HVDeclareLogFunctionsVMBusChild("ic");
+  typedef IOService super;
 
-private:
-  void handleInterrupt(OSObject *owner, IOInterruptEventSource *sender, int count);
-  IOInterruptEventSource  *interruptSource;
-  
 protected:
-  HyperVVMBusDevice *hvDevice;
-  bool              debugEnabled = false;
-  
-  virtual bool processMessage() = 0;
-  
-  bool createNegotiationResponse(VMBusICMessageNegotiate *negMsg, UInt32 fwVersion, UInt32 msgVersion);
-  
+  HyperVVMBusDevice *_hvDevice = nullptr;
+  void setICDebug(bool debug) { debugEnabled = debug; }
+
+  virtual void handlePacket(VMBusPacketHeader *pktHeader, UInt32 pktHeaderLength, UInt8 *pktData, UInt32 pktDataLength) = 0;
+  virtual UInt32 txBufferSize() { return kHyperVICBufferSize; };
+  virtual UInt32 rxBufferSize() { return kHyperVICBufferSize; };
+  bool processNegotiationResponse(VMBusICMessageNegotiate *negMsg, const VMBusICVersion *msgVersions,
+                                  UInt32 msgVersionsCount, VMBusICVersion *msgVersionUsed = nullptr);
+
 public:
   //
   // IOService overrides.

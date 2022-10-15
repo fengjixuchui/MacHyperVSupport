@@ -2,201 +2,126 @@
 //  HyperVStorage.cpp
 //  Hyper-V storage driver
 //
-//  Copyright © 2021 Goldfish64. All rights reserved.
+//  Copyright © 2021-2022 Goldfish64. All rights reserved.
 //
 
 #include "HyperVStorage.hpp"
 
-#include <Headers/kern_api.hpp>
-
 OSDefineMetaClassAndStructors(HyperVStorage, super);
 
-//
-// Hyper-V storage protocol list.
-//
-static const HyperVStorageProtocol storageProtocols[] = {
-  {
-    kHyperVStorageVersionWin10,
-    kHyperVStoragePostWin7SenseBufferSize,
-    0
-  },
-  {
-    kHyperVStorageVersionWin8_1,
-    kHyperVStoragePostWin7SenseBufferSize,
-    0
-  },
-  {
-    kHyperVStorageVersionWin8,
-    kHyperVStoragePostWin7SenseBufferSize,
-    0
-  },
-  {
-    kHyperVStorageVersionWin7,
-    kHyperVStoragePreWin8SenseBufferSize,
-    sizeof (HyperVStorageSCSIRequestWin8Extension)
-  },
-  {
-    kHyperVStorageVersionWin2008,
-    kHyperVStoragePreWin8SenseBufferSize,
-    sizeof (HyperVStorageSCSIRequestWin8Extension)
-  },
-};
-
 bool HyperVStorage::InitializeController() {
-  HyperVStoragePacket packet;
-  
+  bool                result = false;
+  IOReturn            status;
+
   //
   // Get parent VMBus device object.
   //
-  hvDevice = OSDynamicCast(HyperVVMBusDevice, getProvider());
-  if (hvDevice == NULL) {
+  _hvDevice = OSDynamicCast(HyperVVMBusDevice, getProvider());
+  if (_hvDevice == nullptr) {
+    HVSYSLOG("Provider is not HyperVVMBusDevice");
     return false;
   }
-  hvDevice->retain();
-  
-  debugEnabled = checkKernelArgument("-hvstordbg");
-  hvDevice->setDebugMessagePrinting(checkKernelArgument("-hvstormsgdbg"));
-  
-  HVDBGLOG("Initializing Hyper-V Synthetic Storage controller");
-  
+  _hvDevice->retain();
+
+  HVCheckDebugArgs();
+  HVDBGLOG("Initializing Hyper-V Synthetic Storage");
+
+  if (HVCheckOffArg()) {
+    HVSYSLOG("Disabling Hyper-V Synthetic Storage due to boot arg");
+    OSSafeReleaseNULL(_hvDevice);
+    return false;
+  }
+
   //
   // Assume we are on an older host and take off the Windows 8 extensions by default.
   //
-  packetSizeDelta = sizeof (HyperVStorageSCSIRequestWin8Extension);
-  
-  //
-  // Configure interrupt.
-  // macOS 10.4 always configures the interrupt in the superclass, do
-  // not configure the interrupt ourselves in that case.
-  //
-#if __MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_5
-  if (getKernelVersion() >= KernelVersion::Leopard) {
-#endif
-    interruptSource =
-      IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventAction, this, &HyperVStorage::handleInterrupt), getProvider(), 0);
-    getProvider()->getWorkLoop()->addEventSource(interruptSource);
-    interruptSource->enable();
-#if __MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_5
-  } else {
-    EnableInterrupt();
-  }
-#endif
-  
-  //
-  // Configure the channel.
-  //
-  if (!hvDevice->openChannel(kHyperVStorageRingBufferSize, kHyperVStorageRingBufferSize)) {
-    return false;
-  }
-  
-  //
-  // Begin controller initialization.
-  //
-  clearPacket(&packet);
-  packet.operation = kHyperVStoragePacketOperationBeginInitialization;
-  if (executeCommand(&packet, true) != kIOReturnSuccess) {
-    return false;
-  }
-  
-  //
-  // Negotiate protocol version.
-  //
-  for (UInt32 i = 0; i < ARRAY_SIZE(storageProtocols); i++) {
-    clearPacket(&packet);
-    packet.operation                  = kHyperVStoragePacketOperationQueryProtocolVersion;
-    packet.protocolVersion.majorMinor = storageProtocols[i].protocolVersion;
-    packet.protocolVersion.revision   = 0; // Revision is zero for non-Windows.
-    
-    if (executeCommand(&packet, false) != kIOReturnSuccess) {
-      return false;
-    }
-    
+  _packetSizeDelta = sizeof (HyperVStorageSCSIRequestWin8Extension);
+
+  do {
     //
-    // A success means this protocol version is acceptable.
+    // Install packet handler.
+    // macOS 10.4 always configures the interrupt in the superclass, do
+    // not configure the interrupt ourselves in that case.
     //
-    if (packet.status == 0) {
-      protocolVersion = storageProtocols[i].protocolVersion;
-      senseBufferSize = storageProtocols[i].senseBufferSize;
-      packetSizeDelta = storageProtocols[i].packetSizeDelta;
-      HVDBGLOG("SCSI protocol version: 0x%X, sense buffer size: %u", protocolVersion, senseBufferSize);
+    status = _hvDevice->installPacketActions(this, OSMemberFunctionCast(HyperVVMBusDevice::PacketReadyAction, this, &HyperVStorage::handlePacket),
+                                             OSMemberFunctionCast(HyperVVMBusDevice::WakePacketAction, this, &HyperVStorage::wakePacketHandler),
+                                             PAGE_SIZE, getKernelVersion() >= KernelVersion::Leopard);
+    if (status != kIOReturnSuccess) {
+      HVSYSLOG("Failed to install packet handler with status 0x%X", status);
       break;
     }
-  }
-  
-  if (packet.status != 0) {
-    return false;
-  }
-  
-  //
-  // Query controller properties.
-  //
-  clearPacket(&packet);
-  packet.operation = kHyperVStoragePacketOperationQueryProperties;
-  if (executeCommand(&packet, true) != kIOReturnSuccess) {
-    return false;
-  }
-  
-  subChannelsSupported = packet.storageChannelProperties.flags & kHyperVStorageFlagSupportsMultiChannel;
-  maxSubChannels       = packet.storageChannelProperties.maxChannelCount;
-  maxTransferBytes     = packet.storageChannelProperties.maxTransferBytes;
-  maxPageSegments      = maxTransferBytes / PAGE_SIZE;
-  HVDBGLOG("Multi channel supported: %s, max sub channels: %u, max transfer bytes: %u (%u segments)",
-         subChannelsSupported ? "yes" : "no", maxSubChannels, maxTransferBytes, maxPageSegments);
-  
-  //
-  // Complete initialization.
-  //
-  clearPacket(&packet);
-  packet.operation = kHyperVStoragePacketOperationEndInitialization;
-  if (executeCommand(&packet, true) != kIOReturnSuccess) {
-    return false;
-  }
-  
-  
-  allocateDmaBuffer(&dmaBufTest, 32000000);
-  
-  segs64 = (IODMACommand::Segment64*) IOMalloc(sizeof (IODMACommand::Segment64) * maxPageSegments);
 
-  //
-  // Populate HBA properties.
-  //
-  setHBAInfo();
-  
-  HVSYSLOG("Initialized Hyper-V Synthetic Storage controller");
-  return true;
-}
+#if __MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_5
+    if (getKernelVersion() < KernelVersion::Leopard) {
+      EnableInterrupt();
+    }
+#endif
 
-bool HyperVStorage::allocateDmaBuffer(HyperVDMABuffer *dmaBuf, size_t size) {
-  IOBufferMemoryDescriptor  *bufDesc;
-  
-  //
-  // Create DMA buffer with required specifications and get physical address.
-  //
-  bufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-                                                             kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapInhibitCache | kIOMemoryMapperNone,
-                                                             size, 0xFFFFFFFFFFFFF000ULL);
-  if (bufDesc == NULL) {
-    HVSYSLOG("Failed to allocate DMA buffer memory of %u bytes", size);
-    return false;
+    //
+    // Open VMBus channel and connect to storage.
+    //
+    status = _hvDevice->openVMBusChannel(kHyperVStorageRingBufferSize, kHyperVStorageRingBufferSize);
+    if (status != kIOReturnSuccess) {
+      HVSYSLOG("Failed to open VMBus channel with status 0x%X", status);
+      break;
+    }
+
+    status = connectStorage();
+    if (status != kIOReturnSuccess) {
+      HVSYSLOG("Failed to connect to storage device with status 0x%X", status);
+      break;
+    }
+
+    //
+    // Initialize segments used for DMA.
+    //
+    _segs64 = (IODMACommand::Segment64*) IOMalloc(sizeof (IODMACommand::Segment64) * _maxPageSegments);
+    if (_segs64 == nullptr) {
+      HVSYSLOG("Failed to initialize segments");
+      break;
+    }
+    
+    //
+    // Populate HBA properties and create disk enumeration thread.
+    //
+    setHBAInfo();
+    _scanSCSIDiskThread = thread_call_allocate(OSMemberFunctionCast(thread_call_func_t, this, &HyperVStorage::scanSCSIDisks), this);
+    if (_scanSCSIDiskThread == nullptr) {
+      HVSYSLOG("Failed to create disk enumeration thread");
+      break;
+    }
+
+    result = true;
+    HVDBGLOG("Initialized Hyper-V Synthetic Storage");
+  } while (false);
+
+  if (!result) {
+    TerminateController();
   }
-  bufDesc->prepare();
-  
-  dmaBuf->bufDesc  = bufDesc;
-  dmaBuf->physAddr = bufDesc->getPhysicalAddress();
-  dmaBuf->buffer   = bufDesc->getBytesNoCopy();
-  dmaBuf->size     = size;
-  
-  memset(dmaBuf->buffer, 0, dmaBuf->size);
-  HVDBGLOG("Mapped buffer of %u bytes to 0x%llX", dmaBuf->size, dmaBuf->physAddr);
-  return true;
+  return result;
 }
 
 void HyperVStorage::TerminateController() {
-  HVDBGLOG("Controller is terminated");
+  HVDBGLOG("Stopping Hyper-V Synthetic Storage");
+
+  if (_scanSCSIDiskThread != nullptr) {
+    thread_call_free(_scanSCSIDiskThread);
+  }
+
+  if (_hvDevice != nullptr) {
+    _hvDevice->closeVMBusChannel();
+    _hvDevice->uninstallPacketActions();
+    OSSafeReleaseNULL(_hvDevice);
+  }
+
+  if (_segs64 != nullptr) {
+    IOFree(_segs64, sizeof (IODMACommand::Segment64) * _maxPageSegments);
+  }
 }
 
 bool HyperVStorage::StartController() {
   HVDBGLOG("Controller is now started");
+  startDiskEnumeration();
   return true;
 }
 
@@ -206,17 +131,22 @@ void HyperVStorage::StopController() {
 
 bool HyperVStorage::DoesHBAPerformDeviceManagement() {
   //
-  // Let the OS handle device management.
+  // This driver handles target creation/removal.
+  //
+  return true;
+}
+
+bool HyperVStorage::DoesHBASupportSCSIParallelFeature(SCSIParallelFeature theFeature) {
+  //
+  // No special features are supported.
   //
   return false;
 }
 
-bool HyperVStorage::DoesHBASupportSCSIParallelFeature(SCSIParallelFeature theFeature) {
-  HVDBGLOG("start");
-  return false;
-}
-
 bool HyperVStorage::InitializeTargetForID(SCSITargetIdentifier targetID) {
+  //
+  // Ensure target ID is under maximum.
+  //
   return (targetID < kHyperVStorageMaxTargets);
 }
 
@@ -226,12 +156,12 @@ void HyperVStorage::HandleInterruptRequest() {
   // macOS 10.4 configures the interrupt in the superclass, invoke
   // our interrupt handler here.
   //
-  handleInterrupt(this, NULL, 0);
+  _hvDevice->triggerPacketAction();
 #endif
 }
 
 SCSIInitiatorIdentifier HyperVStorage::ReportInitiatorIdentifier() {
-  return kHyperVStorageMaxLuns;
+  return kHyperVStorageMaxTargets;
 }
 
 SCSIDeviceIdentifier HyperVStorage::ReportHighestSupportedDeviceID() {
@@ -245,7 +175,7 @@ UInt32 HyperVStorage::ReportMaximumTaskCount() {
 
 UInt32 HyperVStorage::ReportHBASpecificTaskDataSize() {
   HVDBGLOG("start");
-  return sizeof (VMBusPacketMultiPageBuffer) + (sizeof (UInt64) * maxPageSegments); //32 * 4096;
+  return sizeof (VMBusPacketMultiPageBuffer) + (sizeof (UInt64) * _maxPageSegments); //32 * 4096;
 }
 
 UInt32 HyperVStorage::ReportHBASpecificDeviceDataSize() {
@@ -259,7 +189,7 @@ IOInterruptEventSource* HyperVStorage::CreateDeviceInterrupt(IOInterruptEventSou
   // Interrupts are handled by the provider, so we do
   // not want the parent class trying to make one.
   //
-  return NULL;
+  return nullptr;
 }
 
 bool HyperVStorage::InitializeDMASpecification(IODMACommand *command) {
@@ -268,7 +198,7 @@ bool HyperVStorage::InitializeDMASpecification(IODMACommand *command) {
   // Hyper-V requires page-sized segments due to its use of page numbers.
   //
   return command->initWithSpecification(kIODMACommandOutputHost64, kHyperVStorageSegmentBits, kHyperVStorageSegmentSize,
-                                        IODMACommand::kMapped, maxTransferBytes, kHyperVStorageSegmentSize);
+                                        IODMACommand::kMapped, _maxTransferBytes, kHyperVStorageSegmentSize);
 }
 
 SCSILogicalUnitNumber HyperVStorage::ReportHBAHighestLogicalUnitNumber() {
@@ -306,118 +236,137 @@ SCSIServiceResponse HyperVStorage::TargetResetRequest(SCSITargetIdentifier theT)
 }
 
 SCSIServiceResponse HyperVStorage::ProcessParallelTask(SCSIParallelTaskIdentifier parallelRequest) {
-  //HVDBGLOG("start");
-  
-  SCSICommandDescriptorBlock cdbData;
-  
-  GetCommandDescriptorBlock(parallelRequest, &cdbData);
-  
-  //HVDBGLOG("######## Attempting CDB 0x%X for target %u, LUN %u ##########", cdbData[0], GetTargetIdentifier(parallelRequest), GetLogicalUnitNumber(parallelRequest));
- // HVDBGLOG("CDB %X %X %X %X %X %X", cdbData[0], cdbData[1], cdbData[2], cdbData[3], cdbData[4], cdbData[5]);
-  
-  HyperVStoragePacket packet;
-  clearPacket(&packet);
-  
-  packet.scsiRequest.targetID = GetTargetIdentifier(parallelRequest);
-  packet.scsiRequest.lun = GetLogicalUnitNumber(parallelRequest);
-  
-  HyperVStorageSCSIRequest *srb = &packet.scsiRequest;
-  
-  srb->win8Extension.srbFlags |= 0x00000008;
-  
-  UInt8 dataDirection = GetDataTransferDirection(parallelRequest);
+  IOReturn            status;
+  HyperVStoragePacket packet = { };
+
+  UInt8                      dataDirection;
+  VMBusPacketMultiPageBuffer *pagePacket;
+  UInt32                     pagePacketLength;
+
+  if (parallelRequest == nullptr) {
+    HVSYSLOG("Invalid SCSI request passed");
+    return kSCSIServiceResponse_FUNCTION_REJECTED;
+  }
+
+  if (GetLogicalUnitNumber(parallelRequest) != 0) {
+    HVDBGLOG("LUN is non-zero");
+    return kSCSIServiceResponse_FUNCTION_REJECTED;
+  }
+
+  //
+  // Create SCSI command execution packet.
+  //
+  packet.operation = kHyperVStoragePacketOperationExecuteSRB;
+  packet.flags     = kHyperVStoragePacketFlagRequestCompletion;
+
+  packet.scsiRequest.targetID        = 0;
+  packet.scsiRequest.lun             = GetTargetIdentifier(parallelRequest);
+  packet.scsiRequest.senseInfoLength = _senseBufferSize;
+  packet.scsiRequest.win8Extension.srbFlags |= 0x00000008;
+  packet.scsiRequest.length = sizeof (packet.scsiRequest); // TODO
+
+  //
+  // Determine data direction flags.
+  //
+  dataDirection = GetDataTransferDirection(parallelRequest);
   switch (dataDirection) {
     case kSCSIDataTransfer_NoDataTransfer:
-      srb->dataIn = kHyperVStorageSCSIRequestTypeUnknown;
-      
+      packet.scsiRequest.dataIn = kHyperVStorageSCSIRequestTypeUnknown;
       break;
-      
+
     case kSCSIDataTransfer_FromInitiatorToTarget:
-      srb->dataIn = kHyperVStorageSCSIRequestTypeWrite;
-      srb->win8Extension.srbFlags |= 0x00000080;
+      packet.scsiRequest.dataIn = kHyperVStorageSCSIRequestTypeWrite;
+      packet.scsiRequest.win8Extension.srbFlags |= 0x00000080;
       break;
-      
+
     case kSCSIDataTransfer_FromTargetToInitiator:
-      srb->dataIn = kHyperVStorageSCSIRequestTypeRead;
-      srb->win8Extension.srbFlags |= 0x00000040;
+      packet.scsiRequest.dataIn = kHyperVStorageSCSIRequestTypeRead;
+      packet.scsiRequest.win8Extension.srbFlags |= 0x00000040;
       break;
-      
+
     default:
       HVDBGLOG("Bad data direction 0x%X", dataDirection);
       return kSCSIServiceResponse_FUNCTION_REJECTED;
-  };
-  
-  srb->cdbLength = GetCommandDescriptorBlockSize(parallelRequest);
-  memcpy(srb->cdb, cdbData, srb->cdbLength);
- // HVDBGLOG("CDB is %u bytes", srb->cdbLength);
-  
-  srb->length = sizeof (HyperVStorageSCSIRequest);
-  srb->senseInfoLength = senseBufferSize;
-  
-  packet.operation = kHyperVStoragePacketOperationExecuteSRB;
-  packet.flags = kHyperVStoragePacketFlagRequestCompletion;
-  
-  currentTask = parallelRequest;
-
-  
-  if (dataDirection != kSCSIDataTransfer_NoDataTransfer) {
-    
-    VMBusPacketMultiPageBuffer *pagePacket;
-    UInt32 pagePacketLength;
-    if (!prepareDataTransfer(parallelRequest, &pagePacket, &pagePacketLength)) {
-      return kSCSIServiceResponse_FUNCTION_REJECTED;
-    }
-    
-    UInt64 lengthPhys = GetRequestedDataTransferCount(parallelRequest);
-    packet.scsiRequest.dataTransferLength = (UInt32) lengthPhys;
-    
-    hvDevice->writeGPADirectMultiPagePacket(&packet, sizeof (packet) - packetSizeDelta, true, pagePacket, pagePacketLength);
-  } else {
-    hvDevice->writeInbandPacket(&packet, sizeof (packet) - packetSizeDelta, true);
   }
-  currentTask = parallelRequest;
-  
-  /*if (dataDirection != kSCSIDataTransfer_NoDataTransfer && request.mbpArray != NULL) {
-    IOFree(request.mbpArray, request.mbpArrayLength);
-  }*/
+  HVDATADBGLOG("Sending command to LUN %u (direction %X) with request %p", packet.scsiRequest.lun,
+               dataDirection, parallelRequest);
 
+  //
+  // Get CDB data.
+  //
+  packet.scsiRequest.cdbLength = GetCommandDescriptorBlockSize(parallelRequest);
+  GetCommandDescriptorBlock(parallelRequest, &packet.scsiRequest.cdb);
+  HVDATADBGLOG("CDB Data %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X",
+               packet.scsiRequest.cdb[0], packet.scsiRequest.cdb[1], packet.scsiRequest.cdb[2], packet.scsiRequest.cdb[3],
+               packet.scsiRequest.cdb[4], packet.scsiRequest.cdb[5], packet.scsiRequest.cdb[6], packet.scsiRequest.cdb[7],
+               packet.scsiRequest.cdb[8], packet.scsiRequest.cdb[9], packet.scsiRequest.cdb[10], packet.scsiRequest.cdb[11],
+               packet.scsiRequest.cdb[12], packet.scsiRequest.cdb[13], packet.scsiRequest.cdb[14], packet.scsiRequest.cdb[15]);
+
+  //
+  // Prepare for data transfer if one is requested.
+  // Otherwise send basic inband packet.
+  //
+  if (dataDirection != kSCSIDataTransfer_NoDataTransfer) {
+    status = prepareDataTransfer(parallelRequest, &pagePacket, &pagePacketLength);
+    if (status != kIOReturnSuccess) {
+      HVDBGLOG("Failed to prepare data transfer with status 0x%X", status);
+      return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+    }
+
+    packet.scsiRequest.dataTransferLength = (UInt32) GetRequestedDataTransferCount(parallelRequest);
+    status = _hvDevice->writeGPADirectMultiPagePacket(&packet, sizeof (packet) - _packetSizeDelta, true,
+                                                      pagePacket, pagePacketLength, nullptr, 0,
+                                                      (UInt64)parallelRequest);
+    if (status != kIOReturnSuccess) {
+      HVDBGLOG("Failed to send data SCSI packet with status 0x%X", status);
+      return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+    }
+  } else {
+    status = _hvDevice->writeInbandPacketWithTransactionId(&packet, sizeof (packet) - _packetSizeDelta, (UInt64)parallelRequest, true);
+    if (status != kIOReturnSuccess) {
+      HVDBGLOG("Failed to send non-data SCSI packet with status 0x%X", status);
+      return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+    }
+  }
+
+  HVDATADBGLOG("Request %p submitted", parallelRequest);
   return kSCSIServiceResponse_Request_In_Process;
 }
 
 void HyperVStorage::ReportHBAConstraints(OSDictionary *constraints) {
   OSNumber *osNumber;
-  
+
   //
   // Populate HBA requirements and limitations.
   //
-  osNumber = OSNumber::withNumber(maxPageSegments, 32);
-  if (osNumber != NULL) {
+  osNumber = OSNumber::withNumber(_maxPageSegments, 32);
+  if (osNumber != nullptr) {
     constraints->setObject(kIOMaximumSegmentCountReadKey, osNumber);
     constraints->setObject(kIOMaximumSegmentCountWriteKey, osNumber);
     osNumber->release();
   }
 
   osNumber = OSNumber::withNumber(kHyperVStorageSegmentSize, 32);
-  if (osNumber != NULL) {
+  if (osNumber != nullptr) {
     constraints->setObject(kIOMaximumSegmentByteCountReadKey, osNumber);
     constraints->setObject(kIOMaximumSegmentByteCountWriteKey, osNumber);
     osNumber->release();
   }
-  
+
   osNumber = OSNumber::withNumber(kHyperVStorageSegmentAlignment, 64);
-  if (osNumber != NULL) {
+  if (osNumber != nullptr) {
     constraints->setObject(kIOMinimumHBADataAlignmentMaskKey, osNumber);
     osNumber->release();
   }
-  
+
   osNumber = OSNumber::withNumber(kHyperVStorageSegmentBits, 32);
-  if (osNumber != NULL) {
+  if (osNumber != nullptr) {
     constraints->setObject(kIOMaximumSegmentAddressableBitCountKey, osNumber);
     osNumber->release();
   }
-  
+
   osNumber = OSNumber::withNumber(4, 32);
-  if (osNumber != NULL) {
+  if (osNumber != nullptr) {
     constraints->setObject(kIOMinimumSegmentAlignmentByteCountKey, osNumber);
     osNumber->release();
   }

@@ -7,56 +7,39 @@
 
 #include "HyperVNetwork.hpp"
 
-void HyperVNetwork::handleInterrupt(OSObject *owner, IOInterruptEventSource *sender, int count) {
-  VMBusPacketType type;
-  UInt32 headersize;
-  UInt32 totalsize;
-  
-  void *responseBuffer;
-  UInt32 responseLength;
-  
-  HyperVNetworkMessage *pktComp;
-  
-  while (true) {
-    if (!hvDevice->nextPacketAvailable(&type, &headersize, &totalsize)) {
-     // HVDBGLOG("last one");
+void HyperVNetwork::handleTimer() {
+  HVSYSLOG("Outstanding sends %u bytes %X %X %X stalls %llu", _sendIndexesOutstanding, preCycle, midCycle, postCycle, stalls);
+}
+
+bool HyperVNetwork::wakePacketHandler(VMBusPacketHeader *pktHeader, UInt32 pktHeaderLength, UInt8 *pktData, UInt32 pktDataLength) {
+  return pktHeader->type == kVMBusPacketTypeCompletion;
+}
+
+void HyperVNetwork::handlePacket(VMBusPacketHeader *pktHeader, UInt32 pktHeaderLength, UInt8 *pktData, UInt32 pktDataLength) {
+  //
+  // Handle inbound packet.
+  //
+  totalbytes += pktHeaderLength + pktDataLength + 8;
+  switch (pktHeader->type) {
+    case kVMBusPacketTypeDataInband:
       break;
-    }
-    
-    UInt8 *buf = (UInt8*)IOMalloc(totalsize);
-    hvDevice->readRawPacket((void*)buf, totalsize);
-    
-    switch (type) {
-      case kVMBusPacketTypeDataInband:
-        break;
-      case kVMBusPacketTypeDataUsingTransferPages:
-        handleRNDISRanges((VMBusPacketTransferPages*) buf, headersize, totalsize);
-        break;
-        
-      case kVMBusPacketTypeCompletion:
-        
-        if (hvDevice->getPendingTransaction(((VMBusPacketHeader*)buf)->transactionId, &responseBuffer, &responseLength)) {
-          memcpy(responseBuffer, (UInt8*)buf + headersize, responseLength);
-          hvDevice->wakeTransaction(((VMBusPacketHeader*)buf)->transactionId);
-        } else {
-          pktComp = (HyperVNetworkMessage*) (buf + headersize);
-          HVDBGLOG("pkt completion status %X %X", pktComp->messageType, pktComp->v1.sendRNDISPacketComplete.status);
-          
-          if (pktComp->messageType == kHyperVNetworkMessageTypeV1SendRNDISPacketComplete) {
-            releaseSendIndex((UInt32)(((VMBusPacketHeader*)buf)->transactionId & ~kHyperVNetworkSendTransIdBits));
-          }
-        }
-        break;
-      default:
-        break;
-    }
-    
-    IOFree(buf, totalsize);
+    case kVMBusPacketTypeDataUsingTransferPages:
+      handleRNDISRanges((VMBusPacketTransferPages*)pktHeader, pktHeaderLength + pktDataLength);
+      break;
+      
+    case kVMBusPacketTypeCompletion:
+      handleCompletion(pktHeader, pktHeaderLength + pktDataLength);
+      break;
+    default:
+      HVSYSLOG("Invalid packet type %X", pktHeader->type);
+      break;
   }
 }
 
-void HyperVNetwork::handleRNDISRanges(VMBusPacketTransferPages *pktPages, UInt32 headerSize, UInt32 pktSize) {
-  HyperVNetworkMessage *netMsg = (HyperVNetworkMessage*) ((UInt8*)pktPages + headerSize);
+void HyperVNetwork::handleRNDISRanges(VMBusPacketTransferPages *pktPages, UInt32 pktSize) {
+  UInt32 pktHeaderSize = HV_GET_VMBUS_PACKETSIZE(pktPages->header.headerLength);
+  
+  HyperVNetworkMessage *netMsg = (HyperVNetworkMessage*) (((UInt8*)pktPages) + pktHeaderSize);
   
   //
   // Ensure packet is valid.
@@ -72,7 +55,7 @@ void HyperVNetwork::handleRNDISRanges(VMBusPacketTransferPages *pktPages, UInt32
   // Process each range which contains a packet.
   //
   for (int i = 0; i < pktPages->rangeCount; i++) {
-    UInt8 *data = receiveBuffer + pktPages->ranges[i].offset;
+    UInt8 *data = ((UInt8*) _receiveBuffer.buffer) + pktPages->ranges[i].offset;
     UInt32 dataLength = pktPages->ranges[i].count;
     
     HVDBGLOG("Got range of %u bytes at 0x%X", dataLength, pktPages->ranges[i].offset);
@@ -84,7 +67,30 @@ void HyperVNetwork::handleRNDISRanges(VMBusPacketTransferPages *pktPages, UInt32
   netMsg2.messageType = kHyperVNetworkMessageTypeV1SendRNDISPacketComplete;
   netMsg2.v1.sendRNDISPacketComplete.status = kHyperVNetworkMessageStatusSuccess;
   
-  hvDevice->writeCompletionPacketWithTransactionId(&netMsg2, sizeof (netMsg2), pktPages->header.transactionId, false);
+  _hvDevice->writeCompletionPacketWithTransactionId(&netMsg2, sizeof (netMsg2), pktPages->header.transactionId, false);
+ // postCycle++;
+}
+
+void HyperVNetwork::handleCompletion(void *pktData, UInt32 pktLength) {
+  VMBusPacketHeader *pktHeader = (VMBusPacketHeader*)pktData;
+  UInt32 pktHeaderSize = HV_GET_VMBUS_PACKETSIZE(pktHeader->headerLength);
+  
+  HyperVNetworkMessage *netMsg;
+    netMsg = (HyperVNetworkMessage*)(((UInt8*)pktData) + pktHeaderSize);
+    if (netMsg->messageType == kHyperVNetworkMessageTypeV1SendRNDISPacketComplete) {
+    //  completions++;
+      //HVSYSLOG("Got index %X", pktHeader->transactionId & ~kHyperVNetworkSendTransIdBits);
+     // if (completions % 100000 == 0)
+     // HVSYSLOG("pkt completion status %X %X %u comple trans %u (free indexes %u)", netMsg->messageType, netMsg->v1.sendRNDISPacketComplete.status, completions, pktHeader->transactionId, getFreeSendIndexCount());
+      
+      if (netMsg->v1.sendRNDISPacketComplete.status != 1) {
+        HVSYSLOG("Got a nonsuccess %u", netMsg->v1.sendRNDISPacketComplete.status);
+      }
+      //HyperVSendPacketThing *pktThing = (HyperVSendPacketThing*)pktHeader->transactionId;
+      releaseSendIndex((UInt32)(pktHeader->transactionId & ~kHyperVNetworkSendTransIdBits));
+    } else {
+      HVSYSLOG("Unknown completion type 0x%X received", netMsg->messageType);
+    }
 }
 
 bool HyperVNetwork::negotiateProtocol(HyperVNetworkProtocolVersion protocolVersion) {
@@ -95,7 +101,7 @@ bool HyperVNetwork::negotiateProtocol(HyperVNetworkProtocolVersion protocolVersi
   netMsg.init.initVersion.maxProtocolVersion = protocolVersion;
   netMsg.init.initVersion.minProtocolVersion = protocolVersion;
 
-  if (hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), true, &netMsg, sizeof (netMsg)) != kIOReturnSuccess) {
+  if (_hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), true, &netMsg, sizeof (netMsg)) != kIOReturnSuccess) {
     HVSYSLOG("failed to send protocol negotiation message");
     return false;
   }
@@ -109,79 +115,179 @@ bool HyperVNetwork::negotiateProtocol(HyperVNetworkProtocolVersion protocolVersi
   return true;
 }
 
-bool HyperVNetwork::initBuffers() {
-  
-  // Allocate receive and send buffers.
-  if (!hvDevice->createGpadlBuffer(receiveBufferSize, &receiveGpadlHandle, (void**)&receiveBuffer)) {
-    HVSYSLOG("Failed to create GPADL for receive buffer");
-    return false;
-  }
-  if (!hvDevice->createGpadlBuffer(sendBufferSize, &sendGpadlHandle, (void**)&sendBuffer)) {
-    HVSYSLOG("Failed to create GPADL for send buffer");
-    return false;
-  }
-  HVDBGLOG("Receive GPADL: 0x%X, send GPADL: 0x%X", receiveGpadlHandle, sendGpadlHandle);
-  
-  // Send receive buffer GPADL handle to Hyper-V.
+IOReturn HyperVNetwork::initSendReceiveBuffers() {
+  IOReturn             status;
   HyperVNetworkMessage netMsg;
-  memset(&netMsg, 0, sizeof (netMsg));
-  netMsg.messageType = kHyperVNetworkMessageTypeV1SendReceiveBuffer;
-  netMsg.v1.sendReceiveBuffer.gpadlHandle = receiveGpadlHandle;
-  netMsg.v1.sendReceiveBuffer.id = kHyperVNetworkReceiveBufferID;
   
-  if (hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), true, &netMsg, sizeof (netMsg)) != kIOReturnSuccess) {
-    HVSYSLOG("Failed to send receive buffer configuration message");
-    return false;
+  //
+  // Older versions of the protocol have a lower recieve buffer size limit.
+  //
+  _receiveBufferSize = (_netVersion > kHyperVNetworkProtocolVersion2) ?
+    kHyperVNetworkReceiveBufferSize : kHyperVNetworkReceiveBufferSizeLegacy;
+  _sendBufferSize    = kHyperVNetworkSendBufferSize;
+
+  //
+  // Allocate receive and send buffers and create GPADLs for them.
+  //
+  if (!_hvDevice->getHvController()->allocateDmaBuffer(&_receiveBuffer, _receiveBufferSize)) {
+    HVSYSLOG("Failed to allocate receive buffer");
+    freeSendReceiveBuffers();
+    return kIOReturnNoResources;
+  }
+  if (_hvDevice->createGPADLBuffer(&_receiveBuffer, &_receiveGpadlHandle) != kIOReturnSuccess) {
+    HVSYSLOG("Failed to create GPADL for receive buffer");
+    freeSendReceiveBuffers();
+    return kIOReturnIOError;
+  }
+  if (!_hvDevice->getHvController()->allocateDmaBuffer(&_sendBuffer, _sendBufferSize)) {
+    HVSYSLOG("Failed to allocate send buffer");
+    freeSendReceiveBuffers();
+    return kIOReturnNoResources;
+  }
+  if (_hvDevice->createGPADLBuffer(&_sendBuffer, &_sendGpadlHandle) != kIOReturnSuccess) {
+    HVSYSLOG("Failed to create GPADL for send buffer");
+    freeSendReceiveBuffers();
+    return kIOReturnIOError;
+  }
+  HVDBGLOG("Receive GPADL: 0x%X, send GPADL: 0x%X", _receiveGpadlHandle, _sendGpadlHandle);
+
+  //
+  // Configure Hyper-V Network with receive buffer GPADL.
+  //
+  bzero(&netMsg, sizeof (netMsg));
+  netMsg.messageType                      = kHyperVNetworkMessageTypeV1SendReceiveBuffer;
+  netMsg.v1.sendReceiveBuffer.gpadlHandle = _receiveGpadlHandle;
+  netMsg.v1.sendReceiveBuffer.id          = kHyperVNetworkReceiveBufferID;
+
+  status = _hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), true, &netMsg, sizeof (netMsg));
+  if (status != kIOReturnSuccess) {
+    HVSYSLOG("Failed to send receive buffer configuration with status 0x%X", status);
+    freeSendReceiveBuffers();
+    return status;
   }
 
   if (netMsg.v1.sendReceiveBufferComplete.status != kHyperVNetworkMessageStatusSuccess) {
-    HVSYSLOG("Failed to configure receive buffer: 0x%X", netMsg.v1.sendReceiveBufferComplete.status);
-    return false;
+    HVSYSLOG("Failed to configure receive buffer with status 0x%X", netMsg.v1.sendReceiveBufferComplete.status);
+    freeSendReceiveBuffers();
+    return kIOReturnIOError;
   }
-  HVDBGLOG("Receive buffer configured with %u sections", netMsg.v1.sendReceiveBufferComplete.numSections);
-  
-  // Linux driver only allows 1 section.
-  if (netMsg.v1.sendReceiveBufferComplete.numSections != 1 || netMsg.v1.sendReceiveBufferComplete.sections[0].offset != 0) {
-    HVSYSLOG("Invalid receive buffer sections");
-    return false;
-  }
-  
-  // Send send buffer GPADL handle to Hyper-V.
-  memset(&netMsg, 0, sizeof (netMsg));
-  netMsg.messageType = kHyperVNetworkMessageTypeV1SendSendBuffer;
-  netMsg.v1.sendSendBuffer.gpadlHandle = sendGpadlHandle;
-  netMsg.v1.sendSendBuffer.id = kHyperVNetworkSendBufferID;
 
-  if (hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), true, &netMsg, sizeof (netMsg)) != kIOReturnSuccess) {
-    HVSYSLOG("Failed to send send buffer configuration message");
-    return false;
+  //
+  // Only allow 1 receive section.
+  // This is the same as what the Linux driver supports.
+  //
+  if (netMsg.v1.sendReceiveBufferComplete.numSections != 1 || netMsg.v1.sendReceiveBufferComplete.sections[0].offset != 0) {
+    HVSYSLOG("Invalid receive buffer sections: %u", netMsg.v1.sendReceiveBufferComplete.numSections);
+    freeSendReceiveBuffers();
+    return kIOReturnUnsupported;
+  }
+  HVDBGLOG("Receive buffer configured at 0x%p", _receiveBuffer);
+
+  //
+  // Configure Hyper-V Network with send buffer GPADL.
+  //
+  bzero(&netMsg, sizeof (netMsg));
+  netMsg.messageType                   = kHyperVNetworkMessageTypeV1SendSendBuffer;
+  netMsg.v1.sendSendBuffer.gpadlHandle = _sendGpadlHandle;
+  netMsg.v1.sendSendBuffer.id          = kHyperVNetworkSendBufferID;
+
+  status = _hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), true, &netMsg, sizeof (netMsg));
+  if (status != kIOReturnSuccess) {
+    HVSYSLOG("Failed to send send buffer configuration with status 0x%X", status);
+    freeSendReceiveBuffers();
+    return status;
   }
 
   if (netMsg.v1.sendSendBufferComplete.status != kHyperVNetworkMessageStatusSuccess) {
-    HVSYSLOG("Failed to configure send buffer: 0x%X", netMsg.v1.sendSendBufferComplete.status);
-    return false;
+    HVSYSLOG("Failed to configure send buffer with status 0x%X", netMsg.v1.sendSendBufferComplete.status);
+    freeSendReceiveBuffers();
+    return kIOReturnIOError;
   }
-  sendSectionSize = netMsg.v1.sendSendBufferComplete.sectionSize;
-  sendSectionCount = sendBufferSize / sendSectionSize;
-  sendIndexMapSize = (sendSectionCount + sizeof (UInt64) - 1) / sizeof (UInt64);
-  sendIndexMap = (UInt64*)IOMalloc(sendIndexMapSize);
-  memset(sendIndexMap, 0, sendIndexMapSize);
-  HVDBGLOG("send index map size %u", sendIndexMapSize);
-  
-  HVDBGLOG("Send buffer configured with section size of %u bytes and %u sections", sendSectionSize, sendSectionCount);
-  
-  return true;
+
+  //
+  // Create bitmap for send section tracking.
+  //
+  _sendSectionSize        = netMsg.v1.sendSendBufferComplete.sectionSize;
+  _sendSectionCount       = _sendBufferSize / _sendSectionSize;
+  _sendIndexMapSize       = ((_sendSectionCount * sizeof (UInt32)) / 32) + sizeof (UInt32);
+  _sendIndexMap           = (UInt32 *)IOMalloc(_sendIndexMapSize);
+  _sendIndexesOutstanding = 0;
+  if (_sendIndexMap == nullptr) {
+    HVSYSLOG("Failed to allocate send index map");
+    freeSendReceiveBuffers();
+    return kIOReturnNoResources;
+  }
+  bzero(_sendIndexMap, _sendIndexMapSize);
+
+  HVDBGLOG("Send buffer configured at 0x%p-0x%p with section size of %u bytes and %u sections",
+           _sendBuffer.buffer, _sendBuffer.buffer + (_sendSectionSize * (_sendSectionCount - 1)),
+           _sendSectionSize, _sendSectionCount);
+  HVDBGLOG("Send index map size: %u bytes", _sendIndexMapSize);
+  return kIOReturnSuccess;
+}
+
+void HyperVNetwork::freeSendReceiveBuffers() {
+  //
+  // Release and free receive buffer.
+  //
+  if (_receiveGpadlHandle != kHyperVGpadlNullHandle) {
+    _hvDevice->freeGPADLBuffer(_receiveGpadlHandle);
+    _receiveGpadlHandle = kHyperVGpadlNullHandle;
+  }
+  _hvDevice->getHvController()->freeDmaBuffer(&_receiveBuffer);
+
+  //
+  // Release and free send buffer.
+  //
+  if (_sendGpadlHandle != kHyperVGpadlNullHandle) {
+    _hvDevice->freeGPADLBuffer(_sendGpadlHandle);
+    _sendGpadlHandle = kHyperVGpadlNullHandle;
+  }
+  _hvDevice->getHvController()->freeDmaBuffer(&_sendBuffer);
+
+  //
+  // Free send section tracking bitmap.
+  //
+  if (_sendIndexMap != nullptr) {
+    IOFree(_sendIndexMap, _sendIndexMapSize);
+    _sendIndexMap = nullptr;
+  }
+}
+
+UInt32 HyperVNetwork::getNextSendIndex() {
+  for (UInt32 i = 0; i < _sendSectionCount; i++) {
+    if (!sync_test_and_set_bit(i, _sendIndexMap)) {
+      OSIncrementAtomic(&_sendIndexesOutstanding);
+      return i;
+    }
+  }
+  return kHyperVNetworkRNDISSendSectionIndexInvalid;
+}
+
+UInt32 HyperVNetwork::getFreeSendIndexCount() {
+  UInt32 freeSendIndexCount = 0;
+  for (UInt32 i = 0; i < _sendSectionCount; i++) {
+    if ((_sendIndexMap[i / 32] & (i % 32)) == 0) {
+      freeSendIndexCount++;
+    }
+  }
+  return freeSendIndexCount;
+}
+
+void HyperVNetwork::releaseSendIndex(UInt32 sendIndex) {
+  sync_change_bit(sendIndex, _sendIndexMap);
+  OSDecrementAtomic(&_sendIndexesOutstanding);
 }
 
 bool HyperVNetwork::connectNetwork() {
-  HVDBGLOG("start");
+  IOReturn status;
   
   // Negotiate max protocol version with Hyper-V.
   negotiateProtocol(kHyperVNetworkProtocolVersion1);
-  netVersion = kHyperVNetworkProtocolVersion1;
+  _netVersion = kHyperVNetworkProtocolVersion1;
   
   // Send NDIS version.
-  UInt32 ndisVersion = netVersion > kHyperVNetworkProtocolVersion4 ?
+  UInt32 ndisVersion = _netVersion > kHyperVNetworkProtocolVersion4 ?
     kHyperVNetworkNDISVersion6001E : kHyperVNetworkNDISVersion60001;
   
   HyperVNetworkMessage netMsg;
@@ -190,53 +296,65 @@ bool HyperVNetwork::connectNetwork() {
   netMsg.v1.sendNDISVersion.major = (ndisVersion & 0xFFFF0000) >> 16;
   netMsg.v1.sendNDISVersion.minor = ndisVersion & 0x0000FFFF;
   
-  if (hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), false) != kIOReturnSuccess) {
+  if (_hvDevice->writeInbandPacket(&netMsg, sizeof (netMsg), false) != kIOReturnSuccess) {
     HVSYSLOG("failed to send NDIS version");
     return false;
   }
   
-  receiveBufferSize = netVersion > kHyperVNetworkProtocolVersion2 ?
-    kHyperVNetworkReceiveBufferSize : kHyperVNetworkReceiveBufferSizeLegacy;
-  sendBufferSize = kHyperVNetworkSendBufferSize;
-  initBuffers();
+  status = initSendReceiveBuffers();
+  if (status != kIOReturnSuccess) {
+    HVSYSLOG("Failed to initialize send/receive buffers with status 0x%X", status);
+    return false;
+  }
   
   initializeRNDIS();
   
+  createMediumDictionary();
   readMACAddress();
   updateLinkState(NULL);
+  
+  //UInt32 filter = 0x9;
+  //setRNDISOID(kHyperVNetworkRNDISOIDGeneralCurrentPacketFilter, &filter, sizeof (filter));
   
   return true;
 }
 
-void HyperVNetwork::addNetworkMedium(UInt32 index, UInt32 type, UInt32 speed) {
-  IONetworkMedium *medium = IONetworkMedium::medium(type, speed * MBit, 0, index);
-  if (medium != NULL) {
-    IONetworkMedium::addMedium(mediumDict, medium);
-    medium->release();
-  }
-}
-
 void HyperVNetwork::createMediumDictionary() {
+  OSDictionary *mediumDict;
+  
   //
-  // Create medium dictionary with all possible speeds.
+  // Create medium dictionary.
+  // Speed/duplex is irrelvant for Hyper-V, use basic auto settings.
   //
   mediumDict = OSDictionary::withCapacity(1);
+  if (mediumDict == nullptr) {
+    return;
+  }
   
-  addNetworkMedium(0, kIOMediumEthernetAuto, 0);
+  _networkMedium = IONetworkMedium::medium(kIOMediumEthernetAuto | kIOMediumOptionFullDuplex, 0);
+  if (_networkMedium == nullptr) {
+    mediumDict->release();
+    return;
+  }
   
+  IONetworkMedium::addMedium(mediumDict, _networkMedium);
+
   publishMediumDictionary(mediumDict);
+  setCurrentMedium(_networkMedium);
+  
+  mediumDict->release();
 }
 
 bool HyperVNetwork::readMACAddress() {
-  UInt32 macSize = sizeof (ethAddress.bytes);
-  if (!queryRNDISOID(kHyperVNetworkRNDISOIDEthernetPermanentAddress, (void *)ethAddress.bytes, &macSize)) {
+  UInt32 macSize = sizeof (_ethAddress.bytes);
+  if (getRNDISOID(kHyperVNetworkRNDISOIDEthernetPermanentAddress, (void *)_ethAddress.bytes, &macSize) != kIOReturnSuccess) {
     HVSYSLOG("Failed to get MAC address");
     return false;
   }
   
   HVDBGLOG("MAC address is %02X:%02X:%02X:%02X:%02X:%02X",
-         ethAddress.bytes[0], ethAddress.bytes[1], ethAddress.bytes[2],
-         ethAddress.bytes[3], ethAddress.bytes[4], ethAddress.bytes[5]);
+           _ethAddress.bytes[0], _ethAddress.bytes[1], _ethAddress.bytes[2],
+           _ethAddress.bytes[3], _ethAddress.bytes[4], _ethAddress.bytes[5]);
   return true;
 }
 
@@ -247,15 +365,15 @@ void HyperVNetwork::updateLinkState(HyperVNetworkRNDISMessageIndicateStatus *ind
   if (indicateStatus == NULL) {
     HyperVNetworkRNDISLinkState linkState;
     UInt32 linkStateSize = sizeof (linkState);
-    if (!queryRNDISOID(kHyperVNetworkRNDISOIDGeneralMediaConnectStatus, &linkState, &linkStateSize)) {
+    if (getRNDISOID(kHyperVNetworkRNDISOIDGeneralMediaConnectStatus, &linkState, &linkStateSize) != kIOReturnSuccess) {
       HVSYSLOG("Failed to get link state");
       return;
     }
 
     HVDBGLOG("Link state is initially %s", linkState == kHyperVNetworkRNDISLinkStateConnected ? "up" : "down");
-    isLinkUp = linkState == kHyperVNetworkRNDISLinkStateConnected;
-    if (isLinkUp) {
-      setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, 0);
+    _isLinkUp = linkState == kHyperVNetworkRNDISLinkStateConnected;
+    if (_isLinkUp) {
+      setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, _networkMedium);
     } else {
       setLinkStatus(kIONetworkLinkValid, 0);
     }
@@ -269,33 +387,33 @@ void HyperVNetwork::updateLinkState(HyperVNetworkRNDISMessageIndicateStatus *ind
          indicateStatus->status, indicateStatus->statusBufferOffset, indicateStatus->statusBufferLength);
   switch (indicateStatus->status) {
     case kHyperVNetworkRNDISStatusLinkSpeedChange:
-      HVDBGLOG("Link has changed speeds");
+      // Ignore.
       break;
 
     case kHyperVNetworkRNDISStatusMediaConnect:
-      if (!isLinkUp) {
+      if (!_isLinkUp) {
         HVDBGLOG("Link is coming up");
-        setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, 0);
-        isLinkUp = true;
+        setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, _networkMedium);
+        _isLinkUp = true;
       }
       break;
 
     case kHyperVNetworkRNDISStatusMediaDisconnect:
-      if (isLinkUp) {
+      if (_isLinkUp) {
         HVDBGLOG("Link is going down");
         setLinkStatus(kIONetworkLinkValid, 0);
-        isLinkUp = false;
+        _isLinkUp = false;
       }
       break;
 
     case kHyperVNetworkRNDISStatusNetworkChange:
-      if (isLinkUp) {
+      if (_isLinkUp) {
         //
         // Do a link up and down to force a refresh in the OS.
         //
         HVDBGLOG("Link has changed networks");
         setLinkStatus(kIONetworkLinkValid, 0);
-        setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, 0);
+        setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, _networkMedium);
       }
       break;
 

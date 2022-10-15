@@ -11,13 +11,10 @@
 #include "HyperV.hpp"
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 
-#define super IOACPIPlatformDevice
-
-#define HVSYSLOG(str, ...) HVSYSLOG_PRINT("HyperVPCIProvider", false, 0, str, ## __VA_ARGS__)
-#define HVDBGLOG(str, ...) HVDBGLOG_PRINT("HyperVPCIProvider", false, 0, str, ## __VA_ARGS__)
-
 class HyperVPCIProvider : public IOACPIPlatformDevice {
   OSDeclareDefaultStructors(HyperVPCIProvider);
+  HVDeclareLogFunctions("pcip");
+  typedef IOACPIPlatformDevice super;
   
 public:
   //

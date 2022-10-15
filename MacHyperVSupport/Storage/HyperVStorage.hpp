@@ -2,13 +2,14 @@
 //  HyperVStorage.hpp
 //  Hyper-V storage driver
 //
-//  Copyright © 2021 Goldfish64. All rights reserved.
+//  Copyright © 2021-2022 Goldfish64. All rights reserved.
 //
 
 #ifndef HyperVStorage_hpp
 #define HyperVStorage_hpp
 
 #include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/scsi/SCSICommandOperationCodes.h>
 #include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #include <IOKit/IOKitKeys.h>
 
@@ -20,92 +21,90 @@
 #include "HyperVVMBusDevice.hpp"
 #include "HyperVStorageRegs.hpp"
 
-#define super IOSCSIParallelInterfaceController
-
-#define HVSYSLOG(str, ...) HVSYSLOG_PRINT("HyperVStorage", true, hvDevice->getChannelId(), str, ## __VA_ARGS__)
-#define HVDBGLOG(str, ...) \
-  if (this->debugEnabled) HVDBGLOG_PRINT("HyperVStorage", true, hvDevice->getChannelId(), str, ## __VA_ARGS__)
-
 class HyperVStorage : public IOSCSIParallelInterfaceController {
   OSDeclareDefaultStructors(HyperVStorage);
+  HVDeclareLogFunctionsVMBusChild("stor");
+  typedef IOSCSIParallelInterfaceController super;
 
 private:
-  HyperVVMBusDevice       *hvDevice;
-  IOInterruptEventSource  *interruptSource;
-  bool                    debugEnabled = false;
-  
-  UInt32                  protocolVersion;
-  UInt32                  senseBufferSize;
-  UInt32                  packetSizeDelta;
-  
-  bool                    subChannelsSupported;
-  UInt16                  maxSubChannels;
-  UInt32                  maxTransferBytes;
-  UInt32                  maxPageSegments;
-  
-  SCSIParallelTaskIdentifier  currentTask;
-  bool                        dataTransfer;
-  
-  HyperVDMABuffer             dmaBufTest;
-  
-  IODMACommand::Segment64     *segs64;
-  
-  bool fullBufferUsed;
-  
-  void handleInterrupt(OSObject *owner, IOInterruptEventSource *sender, int count);
-  
-  IOReturn executeCommand(HyperVStoragePacket *packet, bool checkCompletion);
-  inline void clearPacket(HyperVStoragePacket *packet) {
-    memset(packet, 0, sizeof (*packet));
-  }
-  
+  HyperVVMBusDevice *_hvDevice = nullptr;
 
-  bool allocateDmaBuffer(HyperVDMABuffer *dmaBuf, size_t size);
+  //
+  // Storage protocol.
+  //
+  UInt32 _protocolVersion = 0;
+  UInt32 _senseBufferSize = 0;
+  UInt32 _packetSizeDelta = 0;
   
-  void setHBAInfo();
-  
-  void completeIO(HyperVStoragePacket *packet);
-  bool prepareDataTransfer(SCSIParallelTaskIdentifier parallelRequest, VMBusPacketMultiPageBuffer **pagePacket, UInt32 *pagePacketLength);
+  bool   _subChannelsSupported = false;
+  UInt16 _maxSubChannels       = 0;
+  UInt32 _maxTransferBytes     = 0;
+  UInt32 _maxPageSegments      = 0;
+
+  //
+  // Segments for DMA transfers.
+  //
+  IODMACommand::Segment64 *_segs64 = nullptr;
+
+  //
+  // Thread for disk enumeration.
+  //
+  thread_call_t _scanSCSIDiskThread = nullptr;
+
+  //
+  // Packets and I/O.
+  //
+  bool wakePacketHandler(VMBusPacketHeader *pktHeader, UInt32 pktHeaderLength, UInt8 *pktData, UInt32 pktDataLength);
+  void handlePacket(VMBusPacketHeader *pktHeader, UInt32 pktHeaderLength, UInt8 *pktData, UInt32 pktDataLength);
+  void handleIOCompletion(UInt64 transactionId, HyperVStoragePacket *packet);
+  IOReturn sendStorageCommand(HyperVStoragePacket *packet, bool checkCompletion);
+  IOReturn prepareDataTransfer(SCSIParallelTaskIdentifier parallelRequest, VMBusPacketMultiPageBuffer **pagePacket, UInt32 *pagePacketLength);
   void completeDataTransfer(SCSIParallelTaskIdentifier parallelRequest, HyperVStoragePacket *packet);
-  
+
+  //
+  // Disk enumeration and misc.
+  //
+  void setHBAInfo();
+  IOReturn connectStorage();
+  bool checkSCSIDiskPresent(UInt8 diskId);
+  void startDiskEnumeration();
+  void scanSCSIDisks();
+
 protected:
   //
   // IOSCSIParallelInterfaceController overrides.
   //
-  virtual bool InitializeController() APPLE_KEXT_OVERRIDE;
-  virtual void TerminateController() APPLE_KEXT_OVERRIDE;
-  virtual bool StartController() APPLE_KEXT_OVERRIDE;
-  virtual void StopController() APPLE_KEXT_OVERRIDE;
-  virtual bool DoesHBAPerformDeviceManagement() APPLE_KEXT_OVERRIDE;
-  virtual void HandleInterruptRequest() APPLE_KEXT_OVERRIDE;
-  virtual SCSIInitiatorIdentifier ReportInitiatorIdentifier() APPLE_KEXT_OVERRIDE;
-  virtual SCSIDeviceIdentifier ReportHighestSupportedDeviceID() APPLE_KEXT_OVERRIDE;
-  virtual UInt32 ReportMaximumTaskCount() APPLE_KEXT_OVERRIDE;
-  virtual UInt32 ReportHBASpecificTaskDataSize() APPLE_KEXT_OVERRIDE;
-  virtual UInt32 ReportHBASpecificDeviceDataSize() APPLE_KEXT_OVERRIDE;
-  
-  virtual IOInterruptEventSource *CreateDeviceInterrupt(IOInterruptEventSource::Action action,
-                                                        IOFilterInterruptEventSource::Filter filter,
-                                                        IOService *provider) APPLE_KEXT_OVERRIDE;
-  
-  virtual bool InitializeDMASpecification(IODMACommand *command) APPLE_KEXT_OVERRIDE;
-  
+  bool InitializeController() APPLE_KEXT_OVERRIDE;
+  void TerminateController() APPLE_KEXT_OVERRIDE;
+  bool StartController() APPLE_KEXT_OVERRIDE;
+  void StopController() APPLE_KEXT_OVERRIDE;
+  bool DoesHBAPerformDeviceManagement() APPLE_KEXT_OVERRIDE;
+  void HandleInterruptRequest() APPLE_KEXT_OVERRIDE;
+  SCSIInitiatorIdentifier ReportInitiatorIdentifier() APPLE_KEXT_OVERRIDE;
+  SCSIDeviceIdentifier ReportHighestSupportedDeviceID() APPLE_KEXT_OVERRIDE;
+  UInt32 ReportMaximumTaskCount() APPLE_KEXT_OVERRIDE;
+  UInt32 ReportHBASpecificTaskDataSize() APPLE_KEXT_OVERRIDE;
+  UInt32 ReportHBASpecificDeviceDataSize() APPLE_KEXT_OVERRIDE;
+  IOInterruptEventSource *CreateDeviceInterrupt(IOInterruptEventSource::Action action,
+                                                IOFilterInterruptEventSource::Filter filter,
+                                                IOService *provider) APPLE_KEXT_OVERRIDE;
+  bool InitializeDMASpecification(IODMACommand *command) APPLE_KEXT_OVERRIDE;
+
 public:
   //
   // IOSCSIParallelInterfaceController overrides.
   //
-  virtual bool DoesHBASupportSCSIParallelFeature(SCSIParallelFeature theFeature) APPLE_KEXT_OVERRIDE;
-  virtual bool InitializeTargetForID(SCSITargetIdentifier targetID) APPLE_KEXT_OVERRIDE;
-  virtual SCSILogicalUnitNumber ReportHBAHighestLogicalUnitNumber() APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse AbortTaskRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL, SCSITaggedTaskIdentifier theQ) APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse AbortTaskSetRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse ClearACARequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse ClearTaskSetRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse LogicalUnitResetRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse TargetResetRequest(SCSITargetIdentifier theT) APPLE_KEXT_OVERRIDE;
-  virtual SCSIServiceResponse ProcessParallelTask(SCSIParallelTaskIdentifier parallelRequest) APPLE_KEXT_OVERRIDE;
-  
-  virtual void ReportHBAConstraints(OSDictionary *constraints) APPLE_KEXT_OVERRIDE;
+  bool DoesHBASupportSCSIParallelFeature(SCSIParallelFeature theFeature) APPLE_KEXT_OVERRIDE;
+  bool InitializeTargetForID(SCSITargetIdentifier targetID) APPLE_KEXT_OVERRIDE;
+  SCSILogicalUnitNumber ReportHBAHighestLogicalUnitNumber() APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse AbortTaskRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL, SCSITaggedTaskIdentifier theQ) APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse AbortTaskSetRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse ClearACARequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse ClearTaskSetRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse LogicalUnitResetRequest(SCSITargetIdentifier theT, SCSILogicalUnitNumber theL) APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse TargetResetRequest(SCSITargetIdentifier theT) APPLE_KEXT_OVERRIDE;
+  SCSIServiceResponse ProcessParallelTask(SCSIParallelTaskIdentifier parallelRequest) APPLE_KEXT_OVERRIDE;
+  void ReportHBAConstraints(OSDictionary *constraints) APPLE_KEXT_OVERRIDE;
 };
 
 #endif

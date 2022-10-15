@@ -2,28 +2,22 @@
 //  HyperVPlatformProvider.cpp
 //  Hyper-V platform functions provider
 //
-//  Copyright © 2021 Goldfish64. All rights reserved.
+//  Copyright © 2021-2022 Goldfish64. All rights reserved.
 //
+
+#include "HyperVPlatformProvider.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
 
-#include "HyperVPlatformProvider.hpp"
-#include "HyperV.hpp"
-
 #include <IOKit/IOPlatformExpert.h>
-
-#define HVSYSLOG(str, ...) HVSYSLOG_PRINT("HyperVPlatformProvider", false, 0, str, ## __VA_ARGS__)
-#define HVDBGLOG(str, ...) HVDBGLOG_PRINT("HyperVPlatformProvider", false, 0, str, ## __VA_ARGS__)
-
-#define RB_HALT    0x08
 
 HyperVPlatformProvider *HyperVPlatformProvider::instance;
 
 void HyperVPlatformProvider::init() {
   HVDBGLOG("Initializing provider");
-  
+
   //
   // Lilu is used for certain functions of child devices, register patcher callback.
   //
@@ -38,9 +32,9 @@ void HyperVPlatformProvider::init() {
   KernelVersion kernelVersion = getKernelVersion();
   if (kernelVersion >= KernelVersion::SnowLeopard && kernelVersion <= KernelVersion::Sierra) {
     setConsoleInfoAddr = OSMemberFunctionCast(mach_vm_address_t, IOService::getPlatform(), &IOPlatformExpert::setConsoleInfo);
-    
+
     // Save start of function.
-    lilu_os_memcpy(setConsoleInfoOrg, (void *)setConsoleInfoAddr, sizeof(setConsoleInfoOrg));
+    lilu_os_memcpy(setConsoleInfoOrg, (void *)setConsoleInfoAddr, sizeof (setConsoleInfoOrg));
 
     // Patch to call wrapper.
 #if defined(__i386__)
@@ -51,35 +45,35 @@ void HyperVPlatformProvider::init() {
 #error Unsupported arch
 #endif
     if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-      lilu_os_memcpy((void *)setConsoleInfoAddr, patched, sizeof(patched));
+      lilu_os_memcpy((void *)setConsoleInfoAddr, patched, sizeof (patched));
       MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
     }
-    
+
     HVDBGLOG("Patched IOPlatformExpert::setConsoleInfo");
   }
 }
 
 IOReturn HyperVPlatformProvider::wrapSetConsoleInfo(IOPlatformExpert *that, PE_Video *consoleInfo, unsigned int op) {
-  HVDBGLOG("op %X", op);
-  
+  instance->HVDBGLOG("op %X", op);
+
   // Fix arg here
-  if (op == kPEBaseAddressChange && consoleInfo != NULL) {
+  if (op == kPEBaseAddressChange && consoleInfo != nullptr) {
     PE_Video consoleInfoCurrent;
     IOService::getPlatform()->getConsoleInfo(&consoleInfoCurrent);
-    
+
     unsigned long baseAddr = consoleInfo->v_baseAddr;
     memcpy(consoleInfo, &consoleInfoCurrent, sizeof (*consoleInfo));
     consoleInfo->v_baseAddr = baseAddr;
   }
-  
+
   // Restore original function.
   if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-    lilu_os_memcpy((void *)instance->setConsoleInfoAddr, instance->setConsoleInfoOrg, sizeof(instance->setConsoleInfoOrg));
+    lilu_os_memcpy((void *)instance->setConsoleInfoAddr, instance->setConsoleInfoOrg, sizeof (instance->setConsoleInfoOrg));
     MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
   }
-  
+
   IOReturn result = FunctionCast(wrapSetConsoleInfo, instance->setConsoleInfoAddr)(that, consoleInfo, op);
-  
+
   // Patch again if kPEBaseAddressChange was not the operation.
   if (op != kPEBaseAddressChange) {
 #if defined(__i386__)
@@ -90,11 +84,11 @@ IOReturn HyperVPlatformProvider::wrapSetConsoleInfo(IOPlatformExpert *that, PE_V
 #error Unsupported arch
 #endif
     if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-      lilu_os_memcpy((void *)instance->setConsoleInfoAddr, patched, sizeof(patched));
+      lilu_os_memcpy((void *)instance->setConsoleInfoAddr, patched, sizeof (patched));
       MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
     }
   } else {
-    HVDBGLOG("kPEBaseAddressChange specified, not patching again");
+    instance->HVDBGLOG("kPEBaseAddressChange specified, not patching again");
   }
 
   return result;
@@ -102,47 +96,4 @@ IOReturn HyperVPlatformProvider::wrapSetConsoleInfo(IOPlatformExpert *that, PE_V
 
 void HyperVPlatformProvider::onLiluPatcherLoad(KernelPatcher &patcher) {
   HVDBGLOG("Patcher loaded");
-
-  KernelPatcher::RouteRequest requests[] = {
-    { "_reboot", reboot, origReboot }
-  };
-  if (!patcher.routeMultiple(KernelPatcher::KernelID, requests, arrsize(requests))) {
-    HVSYSLOG("Failed to route platform functions");
-    patcher.clearError();
-  }
-}
-
-int HyperVPlatformProvider::reboot(proc_t proc, reboot_args *args, int32_t *retval) {
-  //
-  // Ensure we actually shutdown if we initiated the syscall.
-  // launchd on 10.6 seems to use its own zero flags when its killed, and calls this syscall from itself.
-  //
-  if (instance->isShuttingDown) {
-    args->opt = RB_HALT;
-  }
-  return FunctionCast(reboot, instance->origReboot)(proc, args, retval);
-}
-
-bool HyperVPlatformProvider::canShutdownSystem() {
-  return origReboot != 0;
-}
-
-void HyperVPlatformProvider::shutdownSystem() {
-  HVDBGLOG("Shutdown initiated");
-  
-  //
-  // Invoke reboot syscall to shutdown the system.
-  //
-  if (origReboot != 0) {
-    isShuttingDown = true;
-    
-    reboot_args args;
-    args.opt = RB_HALT;
-    args.command = 0;
-
-    //
-    // This should not return.
-    //
-    reboot(kernproc, &args, NULL);
-  }
 }

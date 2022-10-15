@@ -11,11 +11,6 @@
 
 #include "AppleACPIRange.hpp"
 
-#define super HV_PCIBRIDGE_CLASS
-
-#define HVSYSLOG(str, ...) HVSYSLOG_PRINT("HyperVPCIRoot", false, 0, str, ## __VA_ARGS__)
-#define HVDBGLOG(str, ...) HVDBGLOG_PRINT("HyperVPCIRoot", false, 0, str, ## __VA_ARGS__)
-
 OSDefineMetaClassAndStructors(HyperVPCIRoot, super);
 
 inline bool HyperVPCIRoot::setConfigSpace(IOPCIAddressSpace space, UInt8 offset) {
@@ -33,13 +28,13 @@ bool HyperVPCIRoot::registerChildPCIBridge(IOPCIBridge *pciBridge) {
   //
   OSDictionary *pciMatching = IOService::serviceMatching("HyperVPCIRoot");
   if (pciMatching == NULL) {
-    HVSYSLOG("Failed to create HyperVPCIRoot matching dictionary");
+    //HVSYSLOG("Failed to create HyperVPCIRoot matching dictionary");
     return false;
   }
   
   OSIterator *pciIterator = IOService::getMatchingServices(pciMatching);
   if (pciIterator == NULL) {
-    HVSYSLOG("Failed to create HyperVPCIRoot matching iterator");
+    //HVSYSLOG("Failed to create HyperVPCIRoot matching iterator");
     return false;
   }
   
@@ -48,7 +43,7 @@ bool HyperVPCIRoot::registerChildPCIBridge(IOPCIBridge *pciBridge) {
   pciIterator->release();
   
   if (pciInstance == NULL) {
-    HVSYSLOG("Failed to locate HyperVPCIRoot instance");
+   // HVSYSLOG("Failed to locate HyperVPCIRoot instance");
     return false;
   }
   
@@ -61,13 +56,13 @@ bool HyperVPCIRoot::registerChildPCIBridge(IOPCIBridge *pciBridge) {
     return false;
   }
   
-  HVDBGLOG("Bus %u registered", busNum);
+  //HVDBGLOG("Bus %u registered", busNum);
   pciInstance->pciBridges[busNum] = pciBridge;
   return true;
 }
 
 bool HyperVPCIRoot::start(IOService *provider) {
-  HVSYSLOG("START CLALLED");
+  HVCheckDebugArgs();
   pciLock = IOSimpleLockAlloc();
   
   //

@@ -2,50 +2,48 @@
 //  HyperVKeyboard.hpp
 //  Hyper-V keyboard driver
 //
-//  Copyright © 2021 Goldfish64. All rights reserved.
+//  Copyright © 2021-2022 Goldfish64. All rights reserved.
 //
 
 #ifndef HyperVKeyboard_hpp
 #define HyperVKeyboard_hpp
 
-#include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/hidsystem/IOHIKeyboard.h>
 
 #include "HyperVVMBusDevice.hpp"
 #include "HyperVKeyboardRegs.hpp"
 
-#define super IOHIKeyboard
-
-#define HVSYSLOG(str, ...) HVSYSLOG_PRINT("HyperVKeyboard", true, hvDevice->getChannelId(), str, ## __VA_ARGS__)
-#define HVDBGLOG(str, ...) \
-  if (this->debugEnabled) HVDBGLOG_PRINT("HyperVKeyboard", true, hvDevice->getChannelId(), str, ## __VA_ARGS__)
-
 class HyperVKeyboard : public IOHIKeyboard {
   OSDeclareDefaultStructors(HyperVKeyboard);
+  HVDeclareLogFunctionsVMBusChild("kbd");
+  typedef IOHIKeyboard super;
 
 private:
-  HyperVVMBusDevice       *hvDevice;
-  IOInterruptEventSource  *interruptSource;
-  bool                    debugEnabled = false;
-  
-  void handleInterrupt(OSObject *owner, IOInterruptEventSource *sender, int count);
-  bool connectKeyboard();
-  
+  HyperVVMBusDevice *_hvDevice = nullptr;
+
+  void handlePacket(VMBusPacketHeader *pktHeader, UInt32 pktHeaderLength, UInt8 *pktData, UInt32 pktDataLength);
+  IOReturn connectKeyboard();
+  void dispatchUnicodeKeyboardEvent(UInt16 unicodeChar, bool isBreak);
+
 protected:
-  virtual const unsigned char * defaultKeymapOfLength(UInt32 * length) APPLE_KEXT_OVERRIDE;
-  virtual UInt32 maxKeyCodes() APPLE_KEXT_OVERRIDE;
-  
+  //
+  // IOHIKeyboard overrides.
+  //
+  const unsigned char * defaultKeymapOfLength(UInt32 * length) APPLE_KEXT_OVERRIDE;
+  UInt32 maxKeyCodes() APPLE_KEXT_OVERRIDE;
+
 public:
   //
   // IOService overrides.
   //
-  virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-  
+  bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+  void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+
   //
   // IOHIKeyboard overrides.
   //
-  virtual UInt32 deviceType() APPLE_KEXT_OVERRIDE;
-  virtual UInt32 interfaceID() APPLE_KEXT_OVERRIDE;
+  UInt32 deviceType() APPLE_KEXT_OVERRIDE;
+  UInt32 interfaceID() APPLE_KEXT_OVERRIDE;
 };
 
 #endif
