@@ -11,6 +11,7 @@ All Intel macOS versions are supported. macOS 12.0 and newer should use `MacHype
 - Heartbeat
 - Guest shutdown (with daemon)
 - Time synchronization (with daemon)
+- Host to guest file copy (with daemon)
 - PCI passthrough (partial support)
 - Synthetic graphics (partial support)
 - Synthetic keyboard
@@ -93,7 +94,7 @@ All Intel macOS versions are supported. macOS 12.0 and newer should use `MacHype
 | Module              | Debug            | Message Debug     | Off               |
 |---------------------|------------------|-------------------|-------------------|
 | CPU disabler (10.4) | -hvcpudbg        | N/A               | N/A               |
-| Graphics            | -hvgfxdbg        | -hvgfxmsgdbg      | -hvgfxoff         |
+| Graphics bridge     | -hvgfxbdbg       | -hvgfxbmsgdbg     | -hvgfxboff        |
 | Heartbeat           | -hvheartdbg      | -hvheartmsgdbg    | -hvheartoff       |
 | Keyboard            | -hvkbddbg        | -hvkbdmsgdbg      | -hvkbdoff         |
 | Mouse               | -hvmousdbg       | -hvmousmsgdbg     | -hvmousoff        |
@@ -112,5 +113,6 @@ All Intel macOS versions are supported. macOS 12.0 and newer should use `MacHype
 - [Apple](https://www.apple.com) for macOS
 - [Goldfish64](https://github.com/Goldfish64) for this software
 - [vit9696](https://github.com/vit9696) for [Lilu.kext](https://github.com/acidanthera/Lilu) and providing assistance
+- [flagers](https://github.com/flagersgit) for file copy implementation and providing assistance
 - [Microsoft Hypervisor Top-Level Functional Specification](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/reference/tlfs)
 - [Linux](https://github.com/torvalds/linux/tree/master/drivers/hv) and [FreeBSD](https://github.com/freebsd/freebsd-src/tree/main/sys/dev/hyperv) Hyper-V integration services
